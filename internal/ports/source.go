@@ -2,10 +2,9 @@ package ports
 
 import (
 	"context"
-
 	"marketflow/internal/domain"
 )
 
-type TikerSource interface {
+type TickerSource interface {
 	Start(cxt context.Context) <-chan domain.PriceTick
 }
