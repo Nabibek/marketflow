@@ -3,8 +3,6 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"strings"
 	"time"
 
 	"marketflow/internal/domain"
@@ -39,32 +37,36 @@ func (r *PostgresRepo) Close() error {
 	return nil
 }
 
-func (r *PostgresRepo) InsertAggregates(ctx context.Context, items []domain.Aggregate) error {
-	if len(items) == 0 {
+func (p *PostgresRepo) InsertAggregates(ctx context.Context, rows []domain.MinAggRow) error {
+	if len(rows) == 0 {
 		return nil
 	}
-	cols := []string{"pair_name", "exchange", "timestamp", "average_price", "min_price", "max_price"}
-
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO market_aggregates (")
-	sb.WriteString(strings.Join(cols, ","))
-	sb.WriteString(") VALUES ")
-	args := make([]interface{}, 0, len(items)*len(cols))
-	for i, it := range items {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		base := i*len(cols) + 1
-		placeholders := make([]string, len(cols))
-		for j := range cols {
-			placeholders[j] = fmt.Sprintf("$%d", base+j)
-		}
-		sb.WriteString("(" + strings.Join(placeholders, ",") + ")")
-
-		args = append(args, it.Symbol, it.Exchange, it.Ts, it.Avg, it.Min, it.Max)
+	const q = `
+		INSERT INTO market_aggregates (pair_name, exchange, timestamp, average_price, min_price, max_price)
+		VALUES ($1,$2,$3,$4,$5,$6)
+	`
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return err
 	}
-	query := sb.String()
+	stmt, err := tx.PrepareContext(ctx, q)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
 
-	_, err := r.db.ExecContext(ctx, query, args...)
-	return err
+	for _, r := range rows {
+		if _, err := stmt.ExecContext(ctx, r.Pair, r.Exchange, r.Ts, r.Avg, r.Min, r.Max); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (p *PostgresRepo) Health(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return p.db.PingContext(ctx)
 }

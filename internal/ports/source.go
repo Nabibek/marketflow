@@ -2,9 +2,14 @@ package ports
 
 import (
 	"context"
+
 	"marketflow/internal/domain"
 )
 
-type TickerSource interface {
-	Start(cxt context.Context) <-chan domain.PriceTick
+type Source interface {
+	// name of exchanges
+	Name() string
+
+	// Start запускает чтение данных и пишет тики
+	Start(cxt context.Context, out chan<- domain.PriceTick) error
 }

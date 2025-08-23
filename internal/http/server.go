@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"marketflow/internal/app"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"marketflow/internal/app"
+	"marketflow/internal/ports"
 )
 
 type Server struct {
@@ -18,6 +20,7 @@ type Server struct {
 	svc    *app.Service
 	logger *slog.Logger
 	srv    *http.Server
+	repo   ports.Repository
 }
 
 func NewServer(addr string, svc *app.Service, logger *slog.Logger) *Server {
@@ -30,10 +33,19 @@ func NewServer(addr string, svc *app.Service, logger *slog.Logger) *Server {
 
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
+
+	// Маршруты для цен
 	mux.HandleFunc("/prices/latest/", s.handleLatest)
 	mux.HandleFunc("/prices/highest/", s.handleHighest)
 	mux.HandleFunc("/prices/lowest/", s.handleLowest)
 	mux.HandleFunc("/prices/average/", s.handleAverage)
+
+	// Обработка здоровья сервера
+	mux.HandleFunc("/health", s.handleHealth)
+
+	// Обработка переключения режимов
+	mux.HandleFunc("/mode/test", s.handleModeTest)
+	mux.HandleFunc("/mode/live", s.handleModeLive)
 
 	s.srv = &http.Server{
 		Addr:    s.addr,
@@ -57,8 +69,8 @@ func (s *Server) Start(ctx context.Context) error {
 	return s.srv.Serve(ln)
 }
 
+// handleLatest — обработка запроса на последние цены.
 func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request) {
-	// /prices/latest/{symbol}  OR  /prices/latest/{exchange}/{symbol}
 	trim := strings.TrimPrefix(r.URL.Path, "/prices/latest/")
 	parts := strings.Split(trim, "/")
 	if len(parts) == 0 || parts[0] == "" {
@@ -94,6 +106,7 @@ func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"exchange": exchange, "symbol": symbol, "price": p})
 }
 
+// handleHighest — обработка запроса на наибольшую цену.
 func (s *Server) handleHighest(w http.ResponseWriter, r *http.Request) {
 	ex, sym, d, err := parsePathAndPeriod(r.URL.Path, "/prices/highest/", r.URL.Query().Get("period"))
 	if err != nil {
@@ -111,6 +124,7 @@ func (s *Server) handleHighest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLowest — обработка запроса на наименьшую цену.
 func (s *Server) handleLowest(w http.ResponseWriter, r *http.Request) {
 	ex, sym, d, err := parsePathAndPeriod(r.URL.Path, "/prices/lowest/", r.URL.Query().Get("period"))
 	if err != nil {
@@ -128,6 +142,7 @@ func (s *Server) handleLowest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAverage — обработка запроса на среднюю цену.
 func (s *Server) handleAverage(w http.ResponseWriter, r *http.Request) {
 	ex, sym, d, err := parsePathAndPeriod(r.URL.Path, "/prices/average/", r.URL.Query().Get("period"))
 	if err != nil {
@@ -145,17 +160,13 @@ func (s *Server) handleAverage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// writeJSON — вспомогательная функция для записи JSON-ответа.
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// parsePathAndPeriod поддерживает:
-//
-//	/prices/.../{symbol}
-//	/prices/.../{exchange}/{symbol}
-//
-// period по умолчанию 1m; допускаем s/m (и числа, трактуем как секунды).
+// parsePathAndPeriod — помогает разбирать URL для обработки путей и периода.
 func parsePathAndPeriod(path, prefix, period string) (exchange, symbol string, d time.Duration, err error) {
 	trim := strings.TrimPrefix(path, prefix)
 	parts := strings.Split(trim, "/")
@@ -183,4 +194,36 @@ func parsePathAndPeriod(path, prefix, period string) (exchange, symbol string, d
 		return exchange, symbol, time.Duration(n) * time.Second, nil
 	}
 	return "", "", 0, fmt.Errorf("invalid period: %q", period)
+}
+
+func (s *Server) WithRepo(repo ports.Repository) *Server {
+	s.repo = repo
+	return s
+}
+
+// handleHealth — обработка запроса для проверки состояния.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	info := s.svc.Health(ctx, s.repo)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
+}
+
+// handleModeTest — переключение режима на "test".
+func (s *Server) handleModeTest(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("HTTP: switch mode -> test")
+	go s.svc.SwitchMode(r.Context(), app.ModeTest)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"mode":"test"}`))
+}
+
+// handleModeLive — переключение режима на "live".
+func (s *Server) handleModeLive(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("HTTP: switch mode -> live")
+	go s.svc.SwitchMode(r.Context(), app.ModeLive)
+	// пока live-источники не подключены — режим включится, но источников нет
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"mode":"live"}`))
 }

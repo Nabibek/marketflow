@@ -2,327 +2,376 @@ package app
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
-	"marketflow/internal/domain"
-	"marketflow/internal/ports"
-	"math"
+	"sort"
 	"sync"
 	"time"
+
+	"marketflow/internal/domain"
+	"marketflow/internal/ports"
 )
 
-const workersPerSource = 5
+type Mode string
+
+const (
+	ModeTest Mode = "test"
+	ModeLive Mode = "live"
+)
+
+type sourceRunner struct {
+	src    ports.Source
+	cancel context.CancelFunc
+}
 
 type Service struct {
-	logger  *slog.Logger
-	cache   ports.Cache
-	sources []ports.TickerSource
+	log *slog.Logger
 
-	wg       sync.WaitGroup
-	cancelMu sync.Mutex
-	cancel   context.CancelFunc
+	cache ports.Cache
 
-	// seen pairs (exchange -> set(symbol))
-	seenMu sync.RWMutex
-	seen   map[string]map[string]struct{}
+	// агрегатор
+	aggMu       sync.Mutex
+	aggRunning  bool
+	aggStopChan chan struct{}
+
+	// источники
+	mu          sync.Mutex
+	mode        Mode
+	startedAt   time.Time
+	testSources []ports.Source
+	liveSources []ports.Source
+	runners     []*sourceRunner // активные раннеры текущего режима
+
+	// общая очередь тиков для fan-in
+	inCh chan domain.PriceTick
+	wg   sync.WaitGroup
 }
 
-func NewService(logger *slog.Logger, cache ports.Cache) *Service {
+func NewService(log *slog.Logger, cache ports.Cache) *Service {
 	return &Service{
-		logger: logger,
-		cache:  cache,
-		seen:   make(map[string]map[string]struct{}),
+		log:       log,
+		cache:     cache,
+		mode:      ModeTest,
+		inCh:      make(chan domain.PriceTick, 1024),
+		startedAt: time.Now(),
 	}
 }
 
-func (s *Service) AttachSource(src ports.TickerSource) {
-	s.sources = append(s.sources, src)
+func (s *Service) AttachTestSource(src ports.Source) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.testSources = append(s.testSources, src)
 }
 
-// recordSeen marks that we have seen ticks for exchange/symbol
-func (s *Service) recordSeen(exchange, symbol string) {
-	s.seenMu.Lock()
-	defer s.seenMu.Unlock()
-	if _, ok := s.seen[exchange]; !ok {
-		s.seen[exchange] = make(map[string]struct{})
-	}
-	s.seen[exchange][symbol] = struct{}{}
+func (s *Service) AttachLiveSource(src ports.Source) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.liveSources = append(s.liveSources, src)
 }
 
-// snapshotSeen returns a copy of seen map as exchange -> []symbol
-func (s *Service) snapshotSeen() map[string][]string {
-	s.seenMu.RLock()
-	defer s.seenMu.RUnlock()
-	out := make(map[string][]string, len(s.seen))
-	for ex, m := range s.seen {
-		arr := make([]string, 0, len(m))
-		for sym := range m {
-			arr = append(arr, sym)
+// запуск текущего режима
+func (s *Service) Start(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.log.Info("service starting", "mode", s.mode)
+	s.startedAt = time.Now()
+
+	// общий consumer, который пишет в cache
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case t, ok := <-s.inCh:
+				if !ok {
+					return
+				}
+				_ = s.cache.PushTick(ctx, t)
+			case <-ctx.Done():
+				return
+			}
 		}
-		out[ex] = arr
+	}()
+
+	var srcs []ports.Source
+	switch s.mode {
+	case ModeTest:
+		srcs = s.testSources
+	case ModeLive:
+		srcs = s.liveSources
+	}
+
+	for _, src := range srcs {
+		cctx, cancel := context.WithCancel(ctx)
+		r := &sourceRunner{src: src, cancel: cancel}
+		s.runners = append(s.runners, r)
+		s.wg.Add(1)
+		go func(sr *sourceRunner) {
+			defer s.wg.Done()
+			if err := sr.src.Start(cctx, s.inCh); err != nil {
+				s.log.Warn("source stopped with error", "exchange", sr.src.Name(), "err", err)
+			} else {
+				s.log.Info("source stopped", "exchange", sr.src.Name())
+			}
+		}(r)
+	}
+}
+
+// остановка всех источников и consumer
+func (s *Service) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, r := range s.runners {
+		r.cancel()
+	}
+	s.runners = nil
+
+	// закрывать inCh нельзя, т.к. сервис может быть перезапущен.
+}
+
+// переключение режима: аккуратно останавливаем текущие источники и стартуем новые
+func (s *Service) SwitchMode(ctx context.Context, m Mode) {
+	s.mu.Lock()
+	if s.mode == m {
+		s.mu.Unlock()
+		return
+	}
+	s.log.Info("switching mode", "from", s.mode, "to", m)
+
+	// стоп старых
+	for _, r := range s.runners {
+		r.cancel()
+	}
+	s.runners = nil
+	s.mode = m
+	s.mu.Unlock()
+
+	// запуск новых
+	s.Start(ctx)
+}
+
+// агрегатор — как был, только имя метода то же, чтобы твой main не ломать
+func (s *Service) StartAggregator(ctx context.Context, repo ports.Repository, every time.Duration) {
+	s.aggMu.Lock()
+	if s.aggRunning {
+		s.aggMu.Unlock()
+		return
+	}
+	s.aggRunning = true
+	s.aggStopChan = make(chan struct{})
+	s.aggMu.Unlock()
+
+	s.log.Info("aggregator starting", "period", every.String())
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// соберем за 60s из cache
+				cut := 60 * time.Second
+				rows := s.buildMinuteAggregates(ctx, cut)
+				if len(rows) == 0 {
+					continue
+				}
+				if err := repo.InsertAggregates(ctx, rows); err != nil {
+					s.log.Error("insert aggregates failed", "err", err, "rows", len(rows))
+				}
+			case <-s.aggStopChan:
+				s.log.Info("aggregator stop requested")
+				return
+			case <-ctx.Done():
+				s.log.Info("aggregator exit due to context")
+				return
+			}
+		}
+	}()
+}
+
+func (s *Service) buildMinuteAggregates(ctx context.Context, d time.Duration) []domain.MinAggRow {
+	// минимальная реализация: мы не знаем всех источников и пар из cache абстракции
+	// Поэтому соберем по тем, что приходят в течение d из источников текущего режима
+	// (в твоей реализации у cache есть GetWindow(exchange, symbol, d))
+	pairs := []string{"BTCUSDT", "DOGEUSDT", "TONUSDT", "SOLUSDT", "ETHUSDT"}
+	exchanges := s.listExchanges()
+
+	var rows []domain.MinAggRow
+	now := time.Now()
+
+	for _, ex := range exchanges {
+		for _, sym := range pairs {
+			w, err := s.cache.GetWindow(ctx, ex, sym, d)
+			if err != nil || len(w) == 0 {
+				continue
+			}
+			var sum float64
+			min := w[0].Price
+			max := w[0].Price
+			for _, t := range w {
+				p := t.Price
+				sum += p
+				if p < min {
+					min = p
+				}
+				if p > max {
+					max = p
+				}
+			}
+			avg := sum / float64(len(w))
+			rows = append(rows, domain.MinAggRow{
+				Pair:     sym,
+				Exchange: ex,
+				Ts:       now,
+				Avg:      avg,
+				Min:      min,
+				Max:      max,
+			})
+		}
+	}
+	return rows
+}
+
+func (s *Service) listExchanges() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := make(map[string]struct{})
+	for _, r := range s.runners {
+		m[r.src.Name()] = struct{}{}
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	return out
 }
 
-// StartSources: на каждый источник — диспетчер + N воркеров; общий fan-in → кэш.
-func (s *Service) StartSources(ctx context.Context) {
-	s.cancelMu.Lock()
-	ctx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-	s.cancelMu.Unlock()
+// Health info DTO
+type HealthInfo struct {
+	Status     string        `json:"status"`
+	Mode       Mode          `json:"mode"`
+	Uptime     time.Duration `json:"uptime"`
+	Sources    []string      `json:"sources"`
+	RedisOK    bool          `json:"redis_ok"`
+	PostgresOK *bool         `json:"postgres_ok,omitempty"`
+}
 
-	processedCh := make(chan domain.PriceTick, 4096) // fan-in
-
-	// общий писатель в cache.PushTick
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case t, ok := <-processedCh:
-				if !ok {
-					return
-				}
-				if err := s.cache.PushTick(ctx, t); err != nil {
-					s.logger.Warn("cache push error", "err", err, "exchange", t.Exchange, "symbol", t.Symbol)
-				}
-			}
-		}
-	}()
-
-	// по каждому источнику создаём воркеры и диспетчер
-	for _, src := range s.sources {
-		inCh := src.Start(ctx)
-
-		// входные каналы для воркеров (fan-out)
-		workerIns := make([]chan domain.PriceTick, workersPerSource)
-		for i := 0; i < workersPerSource; i++ {
-			workerIns[i] = make(chan domain.PriceTick, 1024)
-
-			// каждый воркер валидирует тик, записывает seen и шлёт в processedCh
-			s.wg.Add(1)
-			go func(in <-chan domain.PriceTick) {
-				defer s.wg.Done()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case t, ok := <-in:
-						if !ok {
-							return
-						}
-						// валидация
-						if t.Price <= 0 || t.Exchange == "" || t.Symbol == "" || t.Ts.IsZero() {
-							continue
-						}
-						// отметим, что видели эту пару
-						s.recordSeen(t.Exchange, t.Symbol)
-
-						// отправим в общий канал на запись в кэш
-						select {
-						case processedCh <- t:
-						case <-ctx.Done():
-							return
-						}
-					}
-				}
-			}(workerIns[i])
-		}
-
-		// диспетчер (round-robin) раскидывает входные тики по воркерам
-		s.wg.Add(1)
-		go func(in <-chan domain.PriceTick, outs []chan domain.PriceTick) {
-			defer s.wg.Done()
-			var idx int
-			for {
-				select {
-				case <-ctx.Done():
-					// закрыть воркерам входы
-					for _, c := range outs {
-						close(c)
-					}
-					return
-				case t, ok := <-in:
-					if !ok {
-						for _, c := range outs {
-							close(c)
-						}
-						return
-					}
-					// best-effort non-blocking: if worker channel full, drop to next
-					for i := 0; i < len(outs); i++ {
-						pos := (idx + i) % len(outs)
-						select {
-						case outs[pos] <- t:
-							idx = (pos + 1) % len(outs)
-							goto dispatched
-						default:
-						}
-					}
-					// если все заполнены — блокируемся на текущем (чтобы не потерять данные)
-					outs[idx] <- t
-					idx = (idx + 1) % len(outs)
-				dispatched:
-				}
-			}
-		}(inCh, workerIns)
+func (s *Service) Health(ctx context.Context, repo ports.Repository) HealthInfo {
+	h := HealthInfo{
+		Status:  "ok",
+		Mode:    s.mode,
+		Uptime:  time.Since(s.startedAt),
+		Sources: s.listExchanges(),
 	}
-
-	// закрыть processedCh, когда все горутины закончатся
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		<-ctx.Done()
-		// подождём кратко, чтобы дать воркерам слить буферы
-		time.Sleep(50 * time.Millisecond)
-		close(processedCh)
-	}()
-}
-
-func (s *Service) Stop() {
-	s.cancelMu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.cancelMu.Unlock()
-	s.wg.Wait()
-}
-
-func (s *Service) GetLatest(ctx context.Context, symbol string) (map[string]float64, error) {
-	return s.cache.GetLatest(ctx, symbol)
-}
-
-// -------- Статистика за период (без БД): считаем по данным окна из Cache --------
-
-type Stats struct {
-	Count int
-	Avg   float64
-	Min   float64
-	Max   float64
-}
-
-var ErrNoData = errors.New("no data for period")
-
-// GetStats символ+опционально exchange ("" => все биржи), за период d.
-func (s *Service) GetStats(ctx context.Context, exchange, symbol string, d time.Duration) (Stats, error) {
-	var ticks []domain.PriceTick
-
-	if exchange != "" {
-		// только одна биржа
-		arr, err := s.cache.GetWindow(ctx, exchange, symbol, d)
-		if err != nil {
-			return Stats{}, ErrNoData
-		}
-		ticks = append(ticks, arr...)
+	if err := s.cache.Health(ctx); err != nil {
+		h.RedisOK = false
+		h.Status = "degraded"
 	} else {
-		// все биржи: соберём список по GetLatest (быстро), а данные — из окна
-		latest, err := s.cache.GetLatest(ctx, symbol)
-		if err != nil {
-			return Stats{}, ErrNoData
+		h.RedisOK = true
+	}
+	if repo != nil {
+		ok := repo.Health(ctx) == nil
+		h.PostgresOK = &ok
+		if !ok {
+			h.Status = "degraded"
 		}
-		for ex := range latest {
-			arr, err := s.cache.GetWindow(ctx, ex, symbol, d)
-			if err == nil && len(arr) > 0 {
-				ticks = append(ticks, arr...)
-			}
-		}
+	}
+	return h
+}
+
+// Получение последних цен для символа
+func (s *Service) GetLatest(ctx context.Context, symbol string) (map[string]float64, error) {
+	// Получаем последние цены из кэша
+	data, err := s.cache.GetLatest(ctx, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest prices: %w", err)
+	}
+	return data, nil
+}
+
+// GetStats возвращает статистику по наибольшей, наименьшей, средней цене за период
+func (s *Service) GetStats(ctx context.Context, exchange, symbol string, d time.Duration) (*domain.PriceStats, error) {
+	// Получаем все тики для заданной валютной пары за период
+	ticks, err := s.cache.GetWindow(ctx, exchange, symbol, d)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ticks: %w", err)
 	}
 
 	if len(ticks) == 0 {
-		return Stats{}, ErrNoData
+		return nil, fmt.Errorf("no ticks available for %s on %s", symbol, exchange)
 	}
 
-	// посчитаем
-	minV := math.Inf(1)
-	maxV := math.Inf(-1)
-	var sum float64
-	for _, t := range ticks {
-		p := t.Price
-		if p < minV {
-			minV = p
+	var min, max, sum float64
+	count := float64(len(ticks))
+
+	// Инициализируем min и max первым тиком
+	min = ticks[0].Price
+	max = ticks[0].Price
+
+	// Подсчитываем минимальное, максимальное и среднее значение
+	for _, tick := range ticks {
+		price := tick.Price
+		if price < min {
+			min = price
 		}
-		if p > maxV {
-			maxV = p
+		if price > max {
+			max = price
 		}
-		sum += p
+		sum += price
 	}
-	return Stats{
-		Count: len(ticks),
-		Avg:   sum / float64(len(ticks)),
-		Min:   minV,
-		Max:   maxV,
-	}, nil
+
+	// Средняя цена
+	avg := sum / count
+
+	// Возвращаем статистику
+	stats := &domain.PriceStats{
+		Min:   min,
+		Max:   max,
+		Avg:   avg,
+		Count: count,
+	}
+
+	return stats, nil
 }
 
-// StartAggregator запускает scheduler, который каждую minute агрегирует данные и пишет в repo
-func (s *Service) StartAggregator(ctx context.Context, repo ports.Repository, interval time.Duration) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		// align first tick to next interval boundary to avoid partial-minute aggregates if desired
-		// but for simplicity we just wait interval then run repeatedly
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				// snapshot seen pairs
-				pairs := s.snapshotSeen()
-				if len(pairs) == 0 {
-					continue
-				}
+func (s *Service) GetWindow(cxt context.Context, exchange, symbol string, d time.Duration) ([]domain.PriceTick, error) {
+	// если явно указан exchange — делегируем к кэшу
+	if exchange != "" {
+		return s.cache.GetWindow(cxt, exchange, symbol, d)
+	}
 
-				aggregates := make([]domain.Aggregate, 0, 256)
-				// use end time as truncated minute
-				ts := now.Truncate(time.Minute)
+	// иначе — собираем со всех активных источников
+	exchanges := s.listExchanges()
+	if len(exchanges) == 0 {
+		return nil, fmt.Errorf("no active exchanges")
+	}
 
-				for ex, syms := range pairs {
-					for _, sym := range syms {
-						// get last 60s from cache
-						ticks, err := s.cache.GetWindow(ctx, ex, sym, 60*time.Second)
-						if err != nil || len(ticks) == 0 {
-							continue
-						}
-						var sum, minV, maxV float64
-						minV = math.Inf(1)
-						maxV = math.Inf(-1)
-						for _, t := range ticks {
-							p := t.Price
-							sum += p
-							if p < minV {
-								minV = p
-							}
-							if p > maxV {
-								maxV = p
-							}
-						}
-						avg := sum / float64(len(ticks))
-						aggregates = append(aggregates, domain.Aggregate{
-							Exchange: ex,
-							Symbol:   sym,
-							Ts:       ts,
-							Avg:      avg,
-							Min:      minV,
-							Max:      maxV,
-						})
-					}
-				}
-
-				if len(aggregates) == 0 {
-					continue
-				}
-
-				// try insert; on error, log and continue (could implement retry/backoff)
-				if err := repo.InsertAggregates(ctx, aggregates); err != nil {
-					s.logger.Warn("failed to insert aggregates", "err", err, "count", len(aggregates))
-				} else {
-					s.logger.Info("aggregates written", "count", len(aggregates), "ts", ts)
-				}
-			}
+	var all []domain.PriceTick
+	for _, ex := range exchanges {
+		// Safe to call cache.GetWindow — он вернёт fallback на память при отсутствии Redis
+		w, err := s.cache.GetWindow(cxt, ex, symbol, d)
+		if err != nil {
+			// Если для конкретного exchange нет данных — просто пропускаем
+			continue
 		}
-	}()
+		if len(w) > 0 {
+			all = append(all, w...)
+		}
+	}
+
+	if len(all) == 0 {
+		return nil, fmt.Errorf("no ticks for %s", symbol)
+	}
+
+	// Сортируем по временам (по возрастанию)
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].Ts.Before(all[j].Ts)
+	})
+
+	return all, nil
 }

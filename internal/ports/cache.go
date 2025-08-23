@@ -2,8 +2,9 @@ package ports
 
 import (
 	"context"
-	"marketflow/internal/domain"
 	"time"
+
+	"marketflow/internal/domain"
 )
 
 type Cache interface {
@@ -11,4 +12,6 @@ type Cache interface {
 	GetLatest(cxt context.Context, symbol string) (map[string]float64, error)
 	GetWindow(cxt context.Context, exchange, symbol string, d time.Duration) ([]domain.PriceTick, error)
 	TrimOld(cxt context.Context, olderThan time.Time) error
+
+	Health(ctx context.Context) error
 }

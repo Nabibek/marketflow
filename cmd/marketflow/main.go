@@ -82,10 +82,10 @@ func main() {
 	// генератор котировок
 	symbols := []string{"BTCUSDT", "DOGEUSDT", "TONUSDT", "SOLUSDT", "ETHUSDT"}
 	gen := exchange.NewGeneratorSource("GENERATOR", symbols, 1*time.Second)
-	svc.AttachSource(gen)
+	svc.AttachTestSource(gen)
 
 	// запуск источников
-	svc.StartSources(ctx)
+	svc.Start(ctx)
 
 	// --- Postgres ---
 	var repo ports.Repository
@@ -114,7 +114,7 @@ func main() {
 
 	// --- HTTP сервер ---
 	addr := fmt.Sprintf(":%d", httpPort)
-	httpSrv := http.NewServer(addr, svc, logger)
+	httpSrv := http.NewServer(addr, svc, logger).WithRepo(repo)
 	go func() {
 		if err := httpSrv.Start(ctx); err != nil && err != context.Canceled {
 			logger.Error("http server failed", "err", err)
