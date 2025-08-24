@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -79,7 +80,7 @@ func (r *RedisCache) PushTick(ctx context.Context, t domain.PriceTick) error {
 
 	// Store the latest price
 	if err := r.rdb.Set(ctx, lastKey(t.Exchange, t.Symbol), b, r.ttl*2).Err(); err != nil {
-		// Fallback to in-memory cache if Redis is unavailable
+		log.Printf("Failed to set last price in Redis: %v", err)
 		_ = r.mem.PushTick(ctx, t)
 		return fmt.Errorf("failed to set last price in Redis for %s:%s, using memory cache", t.Exchange, t.Symbol)
 	}
@@ -131,8 +132,10 @@ func (r *RedisCache) GetLatest(ctx context.Context, symbol string) (map[string]f
 	}
 
 	if len(res) == 0 {
+		log.Printf("No data found for symbol %s, keys: %v", symbol, keys)
 		return nil, fmt.Errorf("no data found for symbol %s", symbol)
 	}
+
 	return res, nil
 }
 

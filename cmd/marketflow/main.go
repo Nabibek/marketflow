@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"marketflow/internal/adapters/exchange"
 	"marketflow/internal/adapters/storage"
 	"marketflow/internal/app"
+	"marketflow/internal/domain"
 	"marketflow/internal/http"
 	"marketflow/internal/logging"
 	"marketflow/internal/ports"
@@ -84,8 +86,24 @@ func main() {
 	gen := exchange.NewGeneratorSource("GENERATOR", symbols, 1*time.Second)
 	svc.AttachTestSource(gen)
 
-	// запуск источников
-	svc.Start(ctx)
+	// live
+
+	priceChan := make(chan domain.PriceTick, 100)
+	svc.AttachLiveSource(exchange.NewTCPSource("EX1", "127.0.0.1:40101", priceChan))
+	svc.AttachLiveSource(exchange.NewTCPSource("EX2", "127.0.0.1:40102", priceChan))
+	svc.AttachLiveSource(exchange.NewTCPSource("EX3", "127.0.0.1:40103", priceChan))
+
+	// Обработка тиков из канала и сохранение в Redis/Postgres.
+	go func() {
+		for tick := range priceChan {
+			log.Printf("Received price tick: %v", tick)
+
+			// Отправка тика в кэш (Redis или in-memory)
+			if err := redisCache.PushTick(ctx, tick); err != nil {
+				log.Printf("Error saving tick: %v", err)
+			}
+		}
+	}()
 
 	// --- Postgres ---
 	var repo ports.Repository
@@ -115,16 +133,18 @@ func main() {
 	// --- HTTP сервер ---
 	addr := fmt.Sprintf(":%d", httpPort)
 	httpSrv := http.NewServer(addr, svc, logger).WithRepo(repo)
-	go func() {
-		if err := httpSrv.Start(ctx); err != nil && err != context.Canceled {
-			logger.Error("http server failed", "err", err)
-			stop()
-		}
-	}()
 
-	// ждем сигнала
-	<-ctx.Done()
-	logger.Info("shutdown initiated")
+	// запускаем сервер в том же потоке, убираем горутину
+	if err := httpSrv.Start(ctx); err != nil && err != context.Canceled {
+		logger.Error("http server failed", "err", err)
+		stop()
+	}
+
+	// Завершаем работу, когда получаем сигнал остановки.
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown initiated")
+	}
 
 	svc.Stop()
 	time.Sleep(100 * time.Millisecond)

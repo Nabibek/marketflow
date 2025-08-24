@@ -3,9 +3,10 @@ package cache
 import (
 	"context"
 	"errors"
-	"marketflow/internal/domain"
 	"sync"
 	"time"
+
+	"marketflow/internal/domain"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -47,6 +48,10 @@ func (m *MemoryCache) backgroundCleaner() {
 
 func (m *MemoryCache) Close() {
 	close(m.done)
+}
+
+func (m *MemoryCache) Health(ctx context.Context) error {
+	return nil
 }
 
 func (m *MemoryCache) PushTick(ctx context.Context, t domain.PriceTick) error {

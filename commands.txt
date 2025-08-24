@@ -1,0 +1,8 @@
+docker load -i exchange1_amd64.tar
+docker load -i exchange2_amd64.tar
+docker load -i exchange3_amd64.tar
+
+
+docker run -p 40101:40101 --name exchange1 -d exchange1:latest
+docker run -p 40102:40102 --name exchange2 -d exchange2:latest
+docker run -p 40103:40103 --name exchange3 -d exchange3:latest

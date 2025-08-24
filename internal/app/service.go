@@ -375,3 +375,24 @@ func (s *Service) GetWindow(cxt context.Context, exchange, symbol string, d time
 
 	return all, nil
 }
+
+func (s *Service) StartLiveSources(ctx context.Context) error {
+	for _, src := range s.liveSources {
+		cctx, cancel := context.WithCancel(ctx)
+		runner := &sourceRunner{src: src, cancel: cancel}
+		s.runners = append(s.runners, runner)
+
+		// Запускаем источник в горутине
+		s.wg.Add(1)
+		go func(r *sourceRunner) {
+			defer s.wg.Done()
+			err := r.src.Start(cctx, s.inCh) // Используем тот самый канал
+			if err != nil {
+				s.log.Warn("Error in live source", "source", r.src.Name(), "error", err)
+			} else {
+				s.log.Info("Source stopped successfully", "source", r.src.Name())
+			}
+		}(runner)
+	}
+	return nil
+}
